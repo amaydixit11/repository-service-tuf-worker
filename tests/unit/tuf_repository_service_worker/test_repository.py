@@ -5366,7 +5366,13 @@ class TestMetadataRepository:
 
         if expected_calls["bump_and_persist"] > 0:
             assert test_repo._bump_and_persist.calls == [
-                pretend.call(delegation, rolename, persist=False, expire=None)
+                pretend.call(
+                    delegation,
+                    rolename,
+                    persist=False,
+                    signer=test_repo._online_key,
+                    expire=None,
+                )
             ]
         if expected_calls["persist"] > 0:
             assert test_repo._persist.calls == [
@@ -5842,7 +5848,7 @@ class TestMetadataRepository:
             lambda *a: None
         )
         test_repo._setup_nested_hashbin_delegations = pretend.call_recorder(
-            lambda *a: {"nested-bin-1": "md1", "nested-bin-2": "md2"}
+            lambda *a, **kw: {"nested-bin-1": "md1", "nested-bin-2": "md2"}
         )
         test_repo._sign = pretend.call_recorder(lambda *a: None)
         monkeypatch.setattr(
@@ -5873,7 +5879,9 @@ class TestMetadataRepository:
         assert len(nested_bins) == 2
         assert delegations.roles[role_name].terminating is False
         assert test_repo._setup_nested_hashbin_delegations.calls == [
-            pretend.call(success[role_name], role_name, 180, 2)
+            pretend.call(
+                success[role_name], role_name, 180, 2, role_key=None
+            )
         ]
         assert test_repo._sign.calls, "Parent role should be signed"
 
@@ -6571,3 +6579,335 @@ class TestMetadataRepository:
         assert parent_role_name in storage_get_calls
         # Bin's snapshot meta entry was added
         assert f"{nested_bin_rolename}.json" in mock_snapshot.signed.meta
+
+    # ---------------------------------------------------------------------
+    # Role-specific online keys for nested hash bins
+    # ---------------------------------------------------------------------
+
+    ROLE_KEY_DICT = {
+        "keytype": "ed25519",
+        "scheme": "ed25519",
+        "keyval": {"public": "cafebabe"},
+        "x-rstuf-key-name": "fastapi-bins",
+        "x-rstuf-online-key-uri": "fn:role_key_id",
+    }
+
+    def _role_key(self):
+        return repository.Key.from_dict(
+            "role_key_id", deepcopy(self.ROLE_KEY_DICT)
+        )
+
+    def _patch_online_key(self, monkeypatch, keyid="online_key_id"):
+        """Serve a repository online key from the ONLINE_KEY setting."""
+        key_dict = {
+            "keyid": keyid,
+            "keytype": "ed25519",
+            "scheme": "ed25519",
+            "keyval": {"public": "abcd1234"},
+        }
+        fake_settings = pretend.stub(
+            get_fresh=pretend.call_recorder(
+                lambda k: copy(key_dict) if k == "ONLINE_KEY" else None
+            )
+        )
+        monkeypatch.setattr(
+            repository,
+            "get_repository_settings",
+            lambda *a, **kw: fake_settings,
+        )
+
+        return keyid
+
+    def _delegations_with_role_key(self, role_name="fastapi"):
+        return Delegations.from_dict(
+            {
+                "keys": {"role_key_id": deepcopy(self.ROLE_KEY_DICT)},
+                "roles": [
+                    {
+                        "keyids": [],
+                        "name": role_name,
+                        "paths": [f"{role_name}/*"],
+                        "terminating": False,
+                        "threshold": 1,
+                        "x-rstuf-expire-policy": 180,
+                        "x-rstuf-num-bins": 2,
+                        "x-rstuf-role-online-key": "role_key_id",
+                    }
+                ],
+            }
+        )
+
+    def test__role_online_key_from_delegations(self, test_repo):
+        delegations = self._delegations_with_role_key()
+
+        key = test_repo._role_online_key_from_delegations(
+            delegations, "fastapi"
+        )
+
+        assert key is not None
+        assert key.keyid == "role_key_id"
+
+    def test__role_online_key_from_delegations_not_declared(self, test_repo):
+        delegations = Delegations.from_dict(
+            {
+                "keys": {},
+                "roles": [
+                    {
+                        "keyids": [],
+                        "name": "fastapi",
+                        "paths": ["fastapi/*"],
+                        "terminating": True,
+                        "threshold": 1,
+                        "x-rstuf-expire-policy": 180,
+                    }
+                ],
+            }
+        )
+
+        assert (
+            test_repo._role_online_key_from_delegations(
+                delegations, "fastapi"
+            )
+            is None
+        )
+
+    def test__role_online_key_from_delegations_missing_key_object(
+        self, test_repo
+    ):
+        """A dangling reference falls back to the repository online key."""
+        delegations = self._delegations_with_role_key()
+        del delegations.keys["role_key_id"]
+
+        assert (
+            test_repo._role_online_key_from_delegations(
+                delegations, "fastapi"
+            )
+            is None
+        )
+
+    def test__role_online_key_from_delegations_without_signer_uri(
+        self, test_repo
+    ):
+        """The Worker cannot sign with a key it cannot resolve to a signer."""
+        delegations = self._delegations_with_role_key()
+        del delegations.keys["role_key_id"].unrecognized_fields[
+            "x-rstuf-online-key-uri"
+        ]
+
+        assert (
+            test_repo._role_online_key_from_delegations(
+                delegations, "fastapi"
+            )
+            is None
+        )
+
+    def test__role_online_key_from_delegations_unknown_role(self, test_repo):
+        delegations = self._delegations_with_role_key()
+
+        assert (
+            test_repo._role_online_key_from_delegations(
+                delegations, "pytorch"
+            )
+            is None
+        )
+
+    def test__signing_key_for_role_top_level_role(
+        self, test_repo, monkeypatch
+    ):
+        online_keyid = self._patch_online_key(monkeypatch)
+
+        assert test_repo._signing_key_for_role("fastapi").keyid == online_keyid
+
+    def test__signing_key_for_role_nested_bin_with_role_key(
+        self, test_repo, monkeypatch
+    ):
+        self._patch_online_key(monkeypatch)
+        role_key = self._role_key()
+        parent = Metadata(
+            Targets(
+                delegations=Delegations(
+                    keys={role_key.keyid: role_key},
+                    succinct_roles=repository.SuccinctRoles(
+                        keyids=[role_key.keyid],
+                        threshold=1,
+                        bit_length=1,
+                        name_prefix="fastapi-bins",
+                    ),
+                )
+            )
+        )
+        test_repo._storage_backend = pretend.stub(
+            get=pretend.call_recorder(lambda role: parent)
+        )
+
+        key = test_repo._signing_key_for_role("fastapi-bins-0")
+
+        assert key.keyid == role_key.keyid
+        assert test_repo._storage_backend.get.calls == [
+            pretend.call("fastapi")
+        ]
+
+    def test__signing_key_for_role_nested_bin_reads_nothing_when_online(
+        self, test_repo, monkeypatch
+    ):
+        """Bins on the repository key must not cost a metadata read.
+
+        A bump walks every bin, so the common case has to stay cheap.
+        """
+        online_keyid = self._patch_online_key(monkeypatch)
+        test_repo._storage_backend = pretend.stub(
+            get=pretend.call_recorder(lambda role: None)
+        )
+
+        key = test_repo._signing_key_for_role(
+            "fastapi-bins-0", [online_keyid]
+        )
+
+        assert key.keyid == online_keyid
+        assert test_repo._storage_backend.get.calls == []
+
+    def test__signing_key_for_role_nested_bin_parent_unreadable(
+        self, test_repo, monkeypatch
+    ):
+        online_keyid = self._patch_online_key(monkeypatch)
+        test_repo._storage_backend = pretend.stub(
+            get=pretend.raiser(StorageError("missing"))
+        )
+
+        key = test_repo._signing_key_for_role("fastapi-bins-0")
+
+        assert key.keyid == online_keyid
+
+    def test__setup_nested_hashbin_delegations_with_role_key(
+        self, test_repo, monkeypatch
+    ):
+        """The bins are keyed by the delegator's own online key."""
+        self._patch_online_key(monkeypatch)
+        role_key = self._role_key()
+        parent_metadata = Metadata(Targets())
+
+        signer = pretend.stub()
+        test_repo._signer_store = pretend.stub(
+            get=pretend.call_recorder(lambda key: signer)
+        )
+        test_repo._persist = pretend.call_recorder(lambda *a, **kw: None)
+        test_repo._bump_expiry = pretend.call_recorder(lambda *a, **kw: None)
+        test_repo._sign = pretend.call_recorder(lambda *a, **kw: None)
+        monkeypatch.setattr(
+            repository.targets_crud,
+            "create_roles",
+            pretend.call_recorder(lambda db, roles: None),
+        )
+
+        result = test_repo._setup_nested_hashbin_delegations(
+            parent_metadata, "fastapi", 90, 2, role_key=role_key
+        )
+
+        assert len(result) == 2
+        delegations = parent_metadata.signed.delegations
+        # The delegator records the key, which is where later bumps read it
+        # back from.
+        assert delegations.succinct_roles.keyids == [role_key.keyid]
+        assert list(delegations.keys) == [role_key.keyid]
+        assert [
+            call.args[0].keyid for call in test_repo._signer_store.get.calls
+        ] == [role_key.keyid]
+
+    def test__add_metadata_delegation_nested_bins_role_online_key(
+        self, test_repo, monkeypatch
+    ):
+        """The role key reaches the bin setup, but never signs the role."""
+        online_keyid = self._patch_online_key(monkeypatch)
+        delegations = self._delegations_with_role_key()
+        targets = Metadata(Targets(delegations=Delegations(keys={}, roles={})))
+
+        test_repo.write_repository_settings = pretend.call_recorder(
+            lambda *a: None
+        )
+        test_repo._setup_nested_hashbin_delegations = pretend.call_recorder(
+            lambda *a, **kw: {"fastapi-bins-0": "md0", "fastapi-bins-1": "md1"}
+        )
+        test_repo._sign = pretend.call_recorder(lambda *a, **kw: None)
+        monkeypatch.setattr(
+            crud,
+            "read_role_deactivated_by_rolename",
+            pretend.call_recorder(lambda *a: None),
+        )
+        monkeypatch.setattr(
+            crud, "create_roles", pretend.call_recorder(lambda *a: None)
+        )
+
+        @contextmanager
+        def mocked_lock(*args, **kwargs):
+            yield
+
+        test_repo._redis = pretend.stub(
+            lock=pretend.call_recorder(mocked_lock)
+        )
+
+        success, failed, nested_bins = test_repo._add_metadata_delegation(
+            delegations, targets, persist_targets=False
+        )
+
+        assert failed == []
+        assert len(nested_bins) == 2
+        setup_call = test_repo._setup_nested_hashbin_delegations.calls[0]
+        assert setup_call.kwargs["role_key"].keyid == "role_key_id"
+        # The delegating metadata must declare the key its role points at,
+        # so a later delegation update can re-send it.
+        assert "role_key_id" in targets.signed.delegations.keys
+        # 'fastapi' itself keeps the repository online key: a delegation
+        # cannot sign itself with the key that signs its bins.
+        assert delegations.roles["fastapi"].keyids == [online_keyid]
+        assert "role_key_id" not in delegations.roles["fastapi"].keyids
+
+    def test_bump_persist_role_nested_bin_signs_with_the_role_key(
+        self, test_repo, monkeypatch
+    ):
+        self._patch_online_key(monkeypatch)
+        role_key = self._role_key()
+        rolename = "fastapi-bins-0"
+        delegation = pretend.stub(
+            signatures={},
+            signed=pretend.stub(),
+            to_dict=pretend.call_recorder(lambda: {"fake": "metadata"}),
+        )
+        test_repo.get_delegation_keyids = pretend.call_recorder(
+            lambda role: [role_key.keyid]
+        )
+        test_repo._signing_key_for_role = pretend.call_recorder(
+            lambda *a: role_key
+        )
+        test_repo._bump_and_persist = pretend.call_recorder(
+            lambda *a, **kw: None
+        )
+        test_repo._persist = pretend.call_recorder(lambda *a, **kw: None)
+        monkeypatch.setattr(test_repo, "_uses_succinct_roles", False)
+
+        test_repo.bump_persist_role(delegation, rolename, from_storage=True)
+
+        assert test_repo._bump_and_persist.calls == [
+            pretend.call(
+                delegation,
+                rolename,
+                persist=False,
+                signer=role_key,
+                expire=None,
+            )
+        ]
+        assert test_repo._persist.calls == [
+            pretend.call(delegation, rolename)
+        ]
+
+    def test__sign_accepts_a_public_key(self, test_repo):
+        role_key = self._role_key()
+        signer = pretend.stub()
+        test_repo._signer_store = pretend.stub(
+            get=pretend.call_recorder(lambda key: signer)
+        )
+        role = pretend.stub(sign=pretend.call_recorder(lambda s: None))
+
+        test_repo._sign(role, role_key)
+
+        assert test_repo._signer_store.get.calls == [pretend.call(role_key)]
+        assert role.sign.calls == [pretend.call(signer)]
