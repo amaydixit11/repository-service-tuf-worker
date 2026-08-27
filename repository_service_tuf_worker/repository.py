@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from math import log
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import redis
@@ -61,7 +61,10 @@ from repository_service_tuf_worker.models import (
     targets_models,
     targets_schema,
 )
-from repository_service_tuf_worker.signer import SignerStore
+from repository_service_tuf_worker.signer import (
+    RSTUF_ONLINE_KEY_URI_FIELD,
+    SignerStore,
+)
 
 KEY_FOR_TYPE_AND_SCHEME.update(
     {
@@ -94,6 +97,13 @@ OFFLINE_KEYS = {
 BINS = "bins"
 NESTED_BINS_SEPARATOR = f"-{BINS}-"
 NESTED_BINS_NAME_SUFFIX = f"-{BINS}"
+# Number of hash bins nested below a custom delegated role.
+NESTED_BINS_FIELD = "x-rstuf-num-bins"
+# Keyid of the online key that signs a role's nested hash bins. The key is
+# declared in the delegating metadata's `keys`, never in the role's own
+# `keyids`: a delegation cannot sign itself, so this key only signs the bins
+# below the role. Absent, the bins fall back to the repository online key.
+ROLE_ONLINE_KEY_FIELD = "x-rstuf-role-online-key"
 SPEC_VERSION: str = ".".join(SPECIFICATION_VERSION)
 
 # lock constants
@@ -242,6 +252,85 @@ class MetadataRepository:
 
         return delegation_keyids
 
+    @staticmethod
+    def _role_online_key_from_delegations(
+        delegations: Optional[Delegations], role_name: str
+    ) -> Optional[Key]:
+        """Role-specific online key declared for ``role_name``, if any.
+
+        The key signs the hash bins nested below the role. It lives in
+        ``delegations.keys`` and is referenced by the role's
+        ``x-rstuf-role-online-key``; it is never in the role's own ``keyids``.
+        """
+        if delegations is None or not delegations.roles:
+            return None
+
+        role = delegations.roles.get(role_name)
+        if role is None:
+            return None
+
+        keyid = role.unrecognized_fields.get(ROLE_ONLINE_KEY_FIELD)
+        if not keyid:
+            return None
+
+        key = delegations.keys.get(keyid)
+        if key is None:
+            logging.warning(
+                f"role '{role_name}' declares online key '{keyid}' that is "
+                "not in delegations.keys, using the repository online key"
+            )
+            return None
+
+        if RSTUF_ONLINE_KEY_URI_FIELD not in key.unrecognized_fields:
+            logging.warning(
+                f"role '{role_name}' online key '{keyid}' has no signer URI, "
+                "using the repository online key"
+            )
+            return None
+
+        return key
+
+    def _signing_key_for_role(
+        self, role_name: str, delegation_keyids: Optional[List[str]] = None
+    ) -> Key:
+        """Return the online key that signs ``role_name``.
+
+        Only nested hash bins can have a role-specific key, and it is declared
+        by their delegator. Everything else uses the repository online key.
+
+        ``delegation_keyids``, when the caller already has it, short-circuits
+        the common case: bins keyed by the repository online key need no
+        further metadata read, which matters when bumping hundreds of them.
+        """
+        if NESTED_BINS_SEPARATOR not in role_name:
+            return self._online_key
+
+        if (
+            delegation_keyids is not None
+            and self._online_key.keyid in delegation_keyids
+        ):
+            return self._online_key
+
+        parent_rolename = role_name.split(NESTED_BINS_SEPARATOR)[0]
+        try:
+            parent: Metadata[Targets] = self._storage_backend.get(
+                parent_rolename
+            )
+            succinct_roles = parent.signed.delegations.succinct_roles
+            # Nested bins always have exactly one signing key: the one the
+            # delegator declared when the bins were created.
+            keyid = succinct_roles.keyids[0]
+            key = parent.signed.delegations.keys[keyid]
+            if RSTUF_ONLINE_KEY_URI_FIELD in key.unrecognized_fields:
+                return key
+        except (StorageError, AttributeError, IndexError, KeyError) as e:
+            logging.debug(
+                f"Could not read the signing key for '{role_name}' from "
+                f"'{parent_rolename}': {e}"
+            )
+
+        return self._online_key
+
     def refresh_settings(self, worker_settings: Optional[Dynaconf] = None):
         """Refreshes the MetadataRepository settings."""
         if worker_settings is None:
@@ -333,14 +422,27 @@ class MetadataRepository:
             return None
         return json.loads(json.dumps(value))
 
-    def _sign(self, role: Metadata, signer: Optional[Signer] = None) -> None:
+    def _sign(
+        self,
+        role: Metadata,
+        signer: Optional[Union[Signer, Key]] = None,
+    ) -> None:
         """
         Re-signs metadata with role-specific key from global key store.
 
         The metadata role type is used as default key id. This is only allowed
         for top-level roles.
+
+        A public ``Key`` may be passed instead of a signer; it is resolved
+        through the same store, so callers that only know which key a role
+        uses do not have to resolve it themselves.
         """
-        role.sign(signer or self._signer_store.get(self._online_key))
+        if signer is None:
+            signer = self._online_key
+        if not hasattr(signer, "sign"):
+            # A public key, not a signer: resolve it through the store.
+            signer = self._signer_store.get(signer)
+        role.sign(signer)
 
     def _persist(self, role: Metadata, role_name: str) -> str:
         """
@@ -401,7 +503,7 @@ class MetadataRepository:
         role: Metadata,
         role_name: str,
         persist: Optional[bool] = True,
-        signer: Optional[Signer] = None,
+        signer: Optional[Union[Signer, Key]] = None,
         expire: Optional[int] = None,
     ):
         """
@@ -577,14 +679,24 @@ class MetadataRepository:
                             rolename
                         ].keyids
 
+                # Nested hash bins may be signed by a key their delegator
+                # declared, rather than by the repository online key.
+                online_key = self._signing_key_for_role(
+                    rolename, delegation_keyids
+                )
+                online_keyid = online_key.keyid
+
                 if (
                     len(delegation_keyids) == 1
-                    and self._online_key.keyid in delegation_keyids
+                    and online_keyid in delegation_keyids
                 ):
                     logging.debug(f"role {rolename} full online keys")
                     logging.debug("update expiry, bump version and persist")
                     self._bump_and_persist(
-                        delegation, delegation_name, persist=False
+                        delegation,
+                        delegation_name,
+                        persist=False,
+                        signer=online_key,
                     )
                     self._persist(delegation, rolename)
                     snapshot.signed.meta[f"{rolename}.json"] = MetaFile(
@@ -594,13 +706,13 @@ class MetadataRepository:
 
                 elif (
                     len(delegation_keyids) > 1
-                    and self._online_key.keyid in delegation_keyids
+                    and online_keyid in delegation_keyids
                 ):
                     logging.debug(f"role {rolename} online/offline keys")
                     self._bump_expiry(delegation, rolename)
                     if source == "storage":
                         self._bump_version(delegation)
-                    self._sign(delegation)
+                    self._sign(delegation, online_key)
                     self.write_repository_settings(
                         f"{rolename.upper()}_SIGNING", delegation.to_dict()
                     )
@@ -1001,10 +1113,16 @@ class MetadataRepository:
         delegator_name: str,
         expiration: int,
         num_bins: int,
+        role_key: Optional[Key] = None,
     ) -> Dict[str, Metadata[Targets]]:
         bit_length = int(log(num_bins, 2))
         name_prefix = f"{delegator_name}{NESTED_BINS_NAME_SUFFIX}"
-        online_key_id = self._online_key.keyid
+        # The delegator may declare its own online key for these bins; without
+        # one they fall back to the repository online key. Either way the key
+        # is recorded in the delegator's own metadata, which is where later
+        # bumps read it back from.
+        online_key = role_key if role_key is not None else self._online_key
+        online_key_id = online_key.keyid
         success = {}
 
         succinct_roles = SuccinctRoles(
@@ -1015,11 +1133,11 @@ class MetadataRepository:
         )
 
         delegator_metadata.signed.delegations = Delegations(
-            keys={online_key_id: self._online_key},
+            keys={online_key_id: online_key},
             succinct_roles=succinct_roles,
         )
 
-        online_key = copy.deepcopy(self._online_key)
+        online_key = copy.deepcopy(online_key)
         expire_bins: int = expiration
         signer = self._signer_store.get(online_key)
 
@@ -1122,7 +1240,10 @@ class MetadataRepository:
             )
 
             num_bins = delegations.roles[role].unrecognized_fields.get(
-                "x-rstuf-num-bins"
+                NESTED_BINS_FIELD
+            )
+            role_key = self._role_online_key_from_delegations(
+                delegations, role
             )
 
             if num_bins is not None:
@@ -1158,9 +1279,25 @@ class MetadataRepository:
                                       hash-bin delegations"
                         )
                         delegations.roles[role].terminating = False
+                        if role_key is not None:
+                            # Declare the role's own online key in the
+                            # delegating metadata as well. It signs the bins,
+                            # not this role, so no role lists it in `keyids` --
+                            # but `x-rstuf-role-online-key` points at it from
+                            # here, and a reference nothing can resolve is
+                            # useless: a later delegation update reads the
+                            # role's configuration out of targets and has to
+                            # be able to re-send the key it names.
+                            targets.signed.delegations.keys.setdefault(
+                                role_key.keyid, role_key
+                            )
                         nested_bin_success = (
                             self._setup_nested_hashbin_delegations(
-                                role_metadata, role, expires, num_bins
+                                role_metadata,
+                                role,
+                                expires,
+                                num_bins,
+                                role_key=role_key,
                             )
                         )
                         nb_success.update(nested_bin_success)
@@ -1389,28 +1526,27 @@ class MetadataRepository:
         from_storage: bool,
     ):
         delegation_keyids = self.get_delegation_keyids(rolename)
+        # Nested hash bins may be signed by a key their delegator declared,
+        # rather than by the repository online key.
+        online_key = self._signing_key_for_role(rolename, delegation_keyids)
+        online_keyid = online_key.keyid
 
-        if (
-            len(delegation_keyids) == 1
-            and self._online_key.keyid in delegation_keyids
-        ):
+        if len(delegation_keyids) == 1 and online_keyid in delegation_keyids:
             logging.debug(f"role {rolename} full online keys")
             logging.debug("update expiry, bump version and persist")
             self._bump_and_persist(
                 delegation,
                 BINS if self.uses_succinct_roles else rolename,
                 persist=False,
+                signer=online_key,
                 expire=self._settings.get_fresh(f"{BINS.upper()}_EXPIRATION"),
             )
             self._persist(delegation, rolename)
 
-        elif (
-            len(delegation_keyids) > 1
-            and self._online_key.keyid in delegation_keyids
-        ):
+        elif len(delegation_keyids) > 1 and online_keyid in delegation_keyids:
             logging.debug(f"role {rolename} online/offline keys")
             self._bump_expiry(delegation, rolename)
-            self._sign(delegation)
+            self._sign(delegation, online_key)
             if from_storage:
                 self._bump_version(delegation)
             self.write_repository_settings(
